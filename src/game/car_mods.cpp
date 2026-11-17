@@ -7,6 +7,7 @@
 // ModInstaller lists it in cars_removed.txt) stays in the saves that kept it, its key naming nothing now: it is taken out
 // of the list here, with the customization and career slots of its record.
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -110,6 +111,98 @@ const std::vector<uint32_t>& RemovedCars() {
     return keys;
 }
 
+// The Agnes Tachyon flipbook (see reference-addon/flipbook_port_hook_investigation.md):
+// the add-on carries two baked running poses as part solids, pose 0 in AGNES_BASE_*
+// (part slot 0) and pose 1 in AGNES_KIT00_BODY_* (part slot 23). The game's world car
+// list at 0x4D5ED0 is a circular doubly-linked list (sentinel = itself); each node holds
+// the render-object pointer at +0x318 and the live world position (x, y, z floats) at
+// +0x320/+0x324/+0x328. A render object's part table is at +0xB94, 76 slots x 5 LODs,
+// entry = +slot*20 + lod*4, and bit 0 of the stored model pointer hides the part
+// (the renderer skips it: test al, 1 at 0x255C40). The render object's type record is
+// at +0x94, its name inline at +0x10 (bhash("AGNES") = 0x026b540d).
+constexpr uint32_t kWorldCarList = 0x4D5ED0;
+constexpr uint32_t kNodeNext = 0x00, kNodeRenderObj = 0x318;
+constexpr uint32_t kNodePosX = 0x320, kNodePosY = 0x324, kNodePosZ = 0x328;
+constexpr uint32_t kRenderObjTypeRecord = 0x94;
+constexpr uint32_t kPartTable = 0xB94, kPartSlotStride = 20, kPartLods = 5;
+constexpr uint32_t kPoseSlotA = 0, kPoseSlotB = 23;  // BASE, _KIT00_BODY
+constexpr uint32_t kAgnesTypeHash = 0x026b540d;      // bhash("AGNES")
+constexpr float kFlipbookStride = 0.5f;              // metres of travel per pose step
+
+bool IsAgnesRenderObj(uint32_t render) {
+    if (!render || !mem::IsCommitted(render + kRenderObjTypeRecord)) return false;
+    uint32_t type_rec = kernel::R32(render + kRenderObjTypeRecord);
+    if (!type_rec || !mem::IsCommitted(type_rec + kTypeName)) return false;
+    // bhash the type name, as TypeOfName does; "AGNES" -> 0x026b540d
+    uint32_t h = 0xFFFFFFFF;
+    for (const auto* p = static_cast<const uint8_t*>(kernel::HostPtr(type_rec + kTypeName)); *p; ++p)
+        h = h * 33 + *p;
+    return h == kAgnesTypeHash;
+}
+
+// While racing, alternate the two baked running poses as the car travels, one pose
+// step per kFlipbookStride metres. Runs once per presented frame from ModCarsFrame;
+// all state lives in port-side statics, no guest memory is used. In the front end /
+// garage (not racing) the state resets, so a race always starts on pose 0.
+void FlipbookFrame() {
+    static float prev_x = 0, prev_y = 0, prev_z = 0;
+    static bool have_prev = false;
+    static double distance = 0;
+    static int pose = -1;  // -1 = no pose applied yet
+    if (!Racing()) {
+        have_prev = false;
+        distance = 0;
+        pose = -1;
+        return;
+    }
+    if (!mem::IsCommitted(kWorldCarList)) return;
+    uint32_t head = kWorldCarList;
+    uint32_t node = kernel::R32(head);
+    bool found = false;
+    for (int guard = 0; node != head && node != 0 && guard < 64; ++guard) {
+        if (!mem::IsCommitted(node) || !mem::IsCommitted(node + kNodePosZ)) break;
+        uint32_t render = kernel::R32(node + kNodeRenderObj);
+        uint32_t next = kernel::R32(node + kNodeNext);
+        if (render && IsAgnesRenderObj(render)) {
+            found = true;
+            float x = 0, y = 0, z = 0;
+            std::memcpy(&x, kernel::HostPtr(node + kNodePosX), 4);
+            std::memcpy(&y, kernel::HostPtr(node + kNodePosY), 4);
+            std::memcpy(&z, kernel::HostPtr(node + kNodePosZ), 4);
+            if (have_prev) {
+                float dx = x - prev_x, dy = y - prev_y, dz = z - prev_z;
+                double step = std::sqrt(double(dx) * dx + double(dy) * dy + double(dz) * dz);
+                if (step < 10.0) distance += step;  // ignore teleports / resets
+            }
+            prev_x = x;
+            prev_y = y;
+            prev_z = z;
+            have_prev = true;
+            int new_pose = int(distance / kFlipbookStride) % 2;
+            if (new_pose != pose) {
+                if (pose == -1) LOGR("flipbook: Agnes pose flipbook active (render object %08X)", render);
+                pose = new_pose;
+                for (uint32_t l = 0; l < kPartLods; ++l) {
+                    uint32_t e_a = render + kPartTable + kPoseSlotA * kPartSlotStride + l * 4;
+                    uint32_t e_b = render + kPartTable + kPoseSlotB * kPartSlotStride + l * 4;
+                    if (!mem::IsCommitted(e_a) || !mem::IsCommitted(e_b)) continue;
+                    uint32_t v_a = kernel::R32(e_a), v_b = kernel::R32(e_b);
+                    uint32_t n_a = (pose == 0) ? (v_a & ~1u) : (v_a | 1u);
+                    uint32_t n_b = (pose == 0) ? (v_b | 1u) : (v_b & ~1u);
+                    if (n_a != v_a) kernel::W32(e_a, n_a);
+                    if (n_b != v_b) kernel::W32(e_b, n_b);
+                }
+            }
+        }
+        node = next;
+    }
+    if (!found) {
+        have_prev = false;
+        distance = 0;
+        pose = -1;
+    }
+}
+
 }  // namespace
 
 // GetTextureInfo's question, on the game thread: our TextureInfo for the name texture's hash, else 0
@@ -157,6 +250,9 @@ void ModCarsFrame(X86Context& ctx) {
     const std::vector<Car>& cars = Cars();
     const std::vector<uint32_t>& removed = RemovedCars();
     if (cars.empty() && removed.empty()) return;
+    // The Agnes flipbook runs next: it needs no profile, and it must run every
+    // frame (not just on the 30-frame car-list sync below).
+    FlipbookFrame();
     uint32_t db = kernel::R32(kFeDatabase);
     uint32_t profile = db && mem::IsCommitted(db + kProfile) ? kernel::R32(db + kProfile) : 0;
     if (!profile || !mem::IsCommitted(profile + kPlayerCarDb + kEntries * kEntry - 1)) return;
