@@ -362,84 +362,97 @@ void ResolveFailLog(int step, uint32_t render) {
 
 // Resolve the BODY model's vertex buffers for an Agnes render object.
 // Validates with the (0.1337, 0, 0) tag, then caches the pointers + remap.
+// Tries every LOD of the BODY slot (0..4): the best LOD (Xbox B, 12941 verts)
+// is the one the anims bin matches, but the part-table LOD index that holds
+// it is not necessarily 0, so a single-LOD read can miss it (that is what
+// "resolve fail step 3" was: the LOD-0 entry had no usable model pointer).
+// Each LOD's entry/model pointer is logged once for diagnosis.
 bool ResolveAgnesModel(uint32_t render, AgnesModel& m) {
     if (m.resolved && m.render == render) return true;
     m = AgnesModel();
     m.render = render;
     const AgnesAnims& anims = LoadAgnesAnims();
     if (!anims.loaded) { ResolveFailLog(1, render); return false; }
-    uint32_t e = render + kPartTable + kAgnesBodySlot * kPartSlotStride + 0 * 4;
-    if (!mem::IsCommitted(e)) { ResolveFailLog(2, render); return false; }
-    uint32_t model = kernel::R32(e) & ~1u;
-    if (!model || !mem::IsCommitted(model + kAgnesModelDef)) { ResolveFailLog(3, render); return false; }
-    uint32_t p = kernel::R32(model + kAgnesModelDef);
-    uint32_t modelData = 0;
-    if (p && mem::IsCommitted(p)) modelData = kernel::R32(p);
-    if (!modelData && mem::IsCommitted(model)) modelData = kernel::R32(model);  // fallback: [model+0]
-    if (!modelData || !mem::IsCommitted(modelData + kModelDataGroupCount)) { ResolveFailLog(4, render); return false; }
-    uint32_t groups = kernel::R32(modelData + kModelDataGroups);
-    uint32_t indexData = kernel::R32(modelData + kModelDataIndices);
-    if (!groups || !indexData) { ResolveFailLog(5, render); return false; }
-    uint16_t gc = 0;
-    std::memcpy(&gc, kernel::HostPtr(modelData + kModelDataGroupCount), 2);
-    if (gc == 0 || gc > kAgnesMaxGroups) { ResolveFailLog(6, render); return false; }
-    // group headers first (vbuf, index count/start), and the index span
-    uint32_t vb[kAgnesMaxGroups] = {};
-    uint32_t istart[kAgnesMaxGroups] = {};
-    uint32_t icount[kAgnesMaxGroups] = {};
-    uint32_t idxSpan = 0;
-    for (uint32_t g = 0; g < gc; ++g) {
-        uint32_t grp = groups + g * kGroupRecordSize;
-        if (!mem::IsCommitted(grp + kGroupVertexData + 4)) { ResolveFailLog(7, render); return false; }
-        vb[g] = kernel::R32(grp + kGroupVertexData);
-        uint16_t ic = 0;
-        uint32_t st = 0;
-        std::memcpy(&ic, kernel::HostPtr(grp + kGroupIndexCount), 2);
-        std::memcpy(&st, kernel::HostPtr(grp + kGroupIndexStart), 4);
-        if (!vb[g] || ic == 0) { ResolveFailLog(8, render); return false; }
-        icount[g] = ic;
-        istart[g] = st;
-        if (st + ic > idxSpan) idxSpan = st + ic;
-    }
-    if (idxSpan == 0 || !mem::IsCommitted(indexData + idxSpan * 2 - 1)) { ResolveFailLog(9, render); return false; }
-    // validate the tag: group 0 vertex 0 normal == (0.1337, 0, 0)
-    float n0[3];
-    std::memcpy(n0, static_cast<const uint8_t*>(kernel::HostPtr(vb[0])) + 0x14, 12);
-    if (std::fabs(n0[0] - kAgnesTagX) > 0.0021f || std::fabs(n0[1]) > 0.0021f || std::fabs(n0[2]) > 0.0021f) {
-        static bool tagFailLogged = false;
-        if (!tagFailLogged) {
-            tagFailLogged = true;
-            LOGR("agnes anim: BODY tag check failed (normal %.4f %.4f %.4f) - is the tagged flipbook installed?",
-                 n0[0], n0[1], n0[2]);
-        }
-        return false;
-    }
-    // copy the index buffer, then build the remap (index-encounter order)
-    std::vector<uint16_t> indices(idxSpan);
-    std::memcpy(indices.data(), kernel::HostPtr(indexData), idxSpan * 2);
-    std::vector<uint32_t> remap(anims.verts, 0xFFFFFFFFu);
-    for (uint32_t g = 0; g < gc; ++g) {
-        m.vbuf[g] = vb[g];
-        m.invRemap[g].reserve(4096);
-        for (uint32_t k = 0; k < icount[g]; ++k) {
-            uint32_t gi = indices[istart[g] + k];
-            if (gi >= anims.verts) continue;
-            if (remap[gi] == 0xFFFFFFFFu) {
-                remap[gi] = (g << 24) | (uint32_t)m.invRemap[g].size();
-                m.invRemap[g].push_back(gi);
+    for (uint32_t lod = 0; lod < kPartLods; ++lod) {
+        uint32_t e = render + kPartTable + kAgnesBodySlot * kPartSlotStride + lod * 4;
+        if (!mem::IsCommitted(e)) continue;
+        uint32_t entryVal = kernel::R32(e);
+        uint32_t model = entryVal & ~1u;
+        {
+            static bool lodLogged[8] = {};
+            if (lod < 8 && !lodLogged[lod]) {
+                lodLogged[lod] = true;
+                LOGR("agnes dbg: BODY lod %u entry=%08X model=%08X", lod, entryVal, model);
             }
         }
-    }
-    for (uint32_t v = 0; v < anims.verts; ++v) {
-        if (remap[v] == 0xFFFFFFFFu) {
-            LOGR("agnes anim: vertex %u not covered by any group", v);
-            return false;
+        if (!model || !mem::IsCommitted(model + kAgnesModelDef)) continue;
+        uint32_t p = kernel::R32(model + kAgnesModelDef);
+        uint32_t modelData = 0;
+        if (p && mem::IsCommitted(p)) modelData = kernel::R32(p);
+        if (!modelData && mem::IsCommitted(model)) modelData = kernel::R32(model);
+        if (!modelData || !mem::IsCommitted(modelData + kModelDataGroupCount)) continue;
+        uint32_t groups = kernel::R32(modelData + kModelDataGroups);
+        uint32_t indexData = kernel::R32(modelData + kModelDataIndices);
+        if (!groups || !indexData) continue;
+        uint16_t gc = 0;
+        std::memcpy(&gc, kernel::HostPtr(modelData + kModelDataGroupCount), 2);
+        if (gc == 0 || gc > kAgnesMaxGroups) continue;
+        // group headers first (vbuf, index count/start), and the index span
+        uint32_t vb[kAgnesMaxGroups] = {};
+        uint32_t istart[kAgnesMaxGroups] = {};
+        uint32_t icount[kAgnesMaxGroups] = {};
+        uint32_t idxSpan = 0;
+        bool groupsOk = true;
+        for (uint32_t g = 0; g < gc; ++g) {
+            uint32_t grp = groups + g * kGroupRecordSize;
+            if (!mem::IsCommitted(grp + kGroupVertexData + 4)) { groupsOk = false; break; }
+            vb[g] = kernel::R32(grp + kGroupVertexData);
+            uint16_t ic = 0;
+            uint32_t st = 0;
+            std::memcpy(&ic, kernel::HostPtr(grp + kGroupIndexCount), 2);
+            std::memcpy(&st, kernel::HostPtr(grp + kGroupIndexStart), 4);
+            if (!vb[g] || ic == 0) { groupsOk = false; break; }
+            icount[g] = ic;
+            istart[g] = st;
+            if (st + ic > idxSpan) idxSpan = st + ic;
         }
+        if (!groupsOk) continue;
+        if (idxSpan == 0 || !mem::IsCommitted(indexData + idxSpan * 2 - 1)) continue;
+        // validate the tag: group 0 vertex 0 normal == (0.1337, 0, 0)
+        float n0[3];
+        std::memcpy(n0, static_cast<const uint8_t*>(kernel::HostPtr(vb[0])) + 0x14, 12);
+        if (std::fabs(n0[0] - kAgnesTagX) > 0.0021f || std::fabs(n0[1]) > 0.0021f || std::fabs(n0[2]) > 0.0021f) continue;
+        // copy the index buffer, then build the remap (index-encounter order)
+        std::vector<uint16_t> indices(idxSpan);
+        std::memcpy(indices.data(), kernel::HostPtr(indexData), idxSpan * 2);
+        std::vector<uint32_t> remap(anims.verts, 0xFFFFFFFFu);
+        AgnesModel tmp;
+        tmp.render = render;
+        bool remapOk = true;
+        for (uint32_t g = 0; g < gc; ++g) {
+            tmp.vbuf[g] = vb[g];
+            tmp.invRemap[g].reserve(4096);
+            for (uint32_t k = 0; k < icount[g]; ++k) {
+                uint32_t gi = indices[istart[g] + k];
+                if (gi >= anims.verts) continue;
+                if (remap[gi] == 0xFFFFFFFFu) {
+                    remap[gi] = (g << 24) | (uint32_t)tmp.invRemap[g].size();
+                    tmp.invRemap[g].push_back(gi);
+                }
+            }
+        }
+        for (uint32_t v = 0; v < anims.verts; ++v) {
+            if (remap[v] == 0xFFFFFFFFu) { remapOk = false; break; }
+        }
+        if (!remapOk) continue;
+        tmp.groupCount = gc;
+        tmp.resolved = true;
+        m = tmp;
+        LOGR("agnes anim: BODY resolved (render %08X, lod %u, %u groups, %u verts)", render, lod, gc, anims.verts);
+        return true;
     }
-    m.groupCount = gc;
-    m.resolved = true;
-    LOGR("agnes anim: BODY resolved (render %08X, %u groups, %u verts)", render, gc, anims.verts);
-    return true;
+    ResolveFailLog(3, render);
+    return false;
 }
 
 // Speed band -> clip index: 0 Walk, 1 Jog, 2 Run, 3 Sprint.
