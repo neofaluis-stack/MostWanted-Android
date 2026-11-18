@@ -7,6 +7,7 @@
 // ModInstaller lists it in cars_removed.txt) stays in the saves that kept it, its key naming nothing now: it is taken out
 // of the list here, with the customization and career slots of its record.
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -236,6 +237,361 @@ void FlipbookFrame() {
     }
 }
 
+// ---- Agnes Tachyon vertex-cache animation (supersedes the flipbook) ----
+// Data: D:\agnes_anims.bin, format AGNV v1 (see reference-addon/agnes_anims.bin).
+//   header 64 B: "AGNV", version u32=1, num_clips u32, vertex_count u32, reserved
+//   per-clip dir (28 B): name[16], frames u32, cycle_seconds f32, data_offset u32
+//   data: frames * vertex_count * 3 f32 positions per clip (NFS/Xbox coords).
+// Clips (30 frames each, 12941 verts): Walk 1.667 s, Jog 1.25 s, Run 1.0 s,
+// Sprint 0.806 s. Speed bands (km/h): 0-15 Walk, 15-30 Jog, 30-70 Run, 70+
+// Sprint. Constant playback per band (no speed scaling); crossfade on band
+// change; frame interpolation so 30 fps keyframes play smoothly at 60 fps.
+// The BODY model (part slot 23) is animated; BASE (slot 0) is hidden. The BODY
+// solid's first vertex normal is tagged (0.1337, 0, 0.0) to confirm the buffer.
+// Vertex buffers: renderObj -> part table +0xB94 -> model (slot 23, lod 0, bit 0
+// masked) -> P=[model+0xC] -> modelData=[P] -> groups=[modelData+0xC] ->
+// group=groups+g*96 -> vbuf=[group+0x30], 32 B/vertex (pos/uv/normal). The port
+// re-uploads guest vertex data every draw, so writing the guest buffer here
+// shows up the same frame. UVs are left untouched (only pos and normal are
+// written); normals are set flat (0,0,1), the look Larzy prefers.
+// Only LOD 0 is animated (the close-up LOD used in races and the garage);
+// lower LODs keep the static pose.
+constexpr uint32_t kAgnesBodySlot = 23;
+constexpr uint32_t kAgnesBaseSlot = 0;
+constexpr uint32_t kAgnesModelDef = 0xC;        // [model+0xC] -> model definition
+constexpr uint32_t kModelDataGroups = 0xC;      // [modelData+0xC] -> groups array
+constexpr uint32_t kModelDataGroupCount = 0x8;  // u16 at [modelData+0x8]
+constexpr uint32_t kModelDataIndices = 0x10;    // [modelData+0x10] -> u16 indices
+constexpr uint32_t kGroupRecordSize = 96;
+constexpr uint32_t kGroupIndexCount = 0x20;     // u16 at [group+0x20]
+constexpr uint32_t kGroupIndexStart = 0x2c;     // u32 at [group+0x2c]
+constexpr uint32_t kGroupVertexData = 0x30;     // [group+0x30] -> vertex buffer
+constexpr float kAgnesTagX = 0.1337f;           // magic normal.x (car index 0)
+constexpr uint32_t kAgnesMaxGroups = 8;
+constexpr float kAgnesCrossfadeSecs = 0.2f;     // seconds to blend between clips
+constexpr float kAgnesFlatNy = 0.0f, kAgnesFlatNz = 1.0f;  // flat normal (0,0,1)
+
+struct AgnesClipInfo {
+    char name[16];
+    uint32_t frames;
+    float cycle;
+    uint32_t data_off;
+};
+
+// The loaded animation file (AGNV v1), kept for the process lifetime.
+struct AgnesAnims {
+    std::vector<uint8_t> file;
+    uint32_t verts = 0;
+    AgnesClipInfo clips[4];
+    int nclips = 0;
+    bool loaded = false;
+    bool tried = false;
+};
+
+const AgnesAnims& LoadAgnesAnims() {
+    static AgnesAnims a;
+    if (a.tried) return a;
+    a.tried = true;
+    std::vector<uint8_t> f;
+    if (!kernel::ReadGameFile("D:\\agnes_anims.bin", f)) {
+        LOGR("agnes anim: D:\\agnes_anims.bin not found");
+        return a;
+    }
+    if (f.size() < 64 || std::memcmp(f.data(), "AGNV", 4) != 0) {
+        LOGR("agnes anim: bad agnes_anims.bin header");
+        return a;
+    }
+    uint32_t ver = 0, ncl = 0, nv = 0;
+    std::memcpy(&ver, f.data() + 4, 4);
+    std::memcpy(&ncl, f.data() + 8, 4);
+    std::memcpy(&nv, f.data() + 12, 4);
+    if (ver != 1 || ncl == 0 || ncl > 4 || nv == 0) {
+        LOGR("agnes anim: bad agnes_anims.bin (ver %u clips %u verts %u)", ver, ncl, nv);
+        return a;
+    }
+    a.file = std::move(f);
+    a.verts = nv;
+    a.nclips = (int)ncl;
+    for (int i = 0; i < a.nclips; ++i) {
+        const uint8_t* e = a.file.data() + 64 + i * 28;
+        std::memcpy(a.clips[i].name, e, 16);
+        a.clips[i].name[15] = 0;
+        std::memcpy(&a.clips[i].frames, e + 16, 4);
+        std::memcpy(&a.clips[i].cycle, e + 20, 4);
+        std::memcpy(&a.clips[i].data_off, e + 24, 4);
+        if (a.clips[i].frames == 0 || a.clips[i].cycle <= 0) {
+            LOGR("agnes anim: bad clip %d", i);
+            a.loaded = false;
+            return a;
+        }
+    }
+    a.loaded = true;
+    LOGR("agnes anim: loaded agnes_anims.bin (%u clips, %u verts)", ncl, nv);
+    return a;
+}
+
+// Per-group vertex buffers + remap for the resolved BODY model (LOD 0).
+struct AgnesModel {
+    bool resolved = false;
+    uint32_t render = 0;
+    uint32_t groupCount = 0;
+    uint32_t vbuf[kAgnesMaxGroups] = {};
+    // invRemap[g][local] = global vertex index (local order = index-encounter order)
+    std::vector<uint32_t> invRemap[kAgnesMaxGroups];
+};
+
+// Resolve the BODY model's vertex buffers for an Agnes render object.
+// Validates with the (0.1337, 0, 0) tag, then caches the pointers + remap.
+bool ResolveAgnesModel(uint32_t render, AgnesModel& m) {
+    if (m.resolved && m.render == render) return true;
+    m = AgnesModel();
+    m.render = render;
+    const AgnesAnims& anims = LoadAgnesAnims();
+    if (!anims.loaded) return false;
+    uint32_t e = render + kPartTable + kAgnesBodySlot * kPartSlotStride + 0 * 4;
+    if (!mem::IsCommitted(e)) return false;
+    uint32_t model = kernel::R32(e) & ~1u;
+    if (!model || !mem::IsCommitted(model + kAgnesModelDef)) return false;
+    uint32_t p = kernel::R32(model + kAgnesModelDef);
+    uint32_t modelData = 0;
+    if (p && mem::IsCommitted(p)) modelData = kernel::R32(p);
+    if (!modelData && mem::IsCommitted(model)) modelData = kernel::R32(model);  // fallback: [model+0]
+    if (!modelData || !mem::IsCommitted(modelData + kModelDataGroupCount)) return false;
+    uint32_t groups = kernel::R32(modelData + kModelDataGroups);
+    uint32_t indexData = kernel::R32(modelData + kModelDataIndices);
+    if (!groups || !indexData) return false;
+    uint16_t gc = 0;
+    std::memcpy(&gc, kernel::HostPtr(modelData + kModelDataGroupCount), 2);
+    if (gc == 0 || gc > kAgnesMaxGroups) return false;
+    // group headers first (vbuf, index count/start), and the index span
+    uint32_t vb[kAgnesMaxGroups] = {};
+    uint32_t istart[kAgnesMaxGroups] = {};
+    uint32_t icount[kAgnesMaxGroups] = {};
+    uint32_t idxSpan = 0;
+    for (uint32_t g = 0; g < gc; ++g) {
+        uint32_t grp = groups + g * kGroupRecordSize;
+        if (!mem::IsCommitted(grp + kGroupVertexData + 4)) return false;
+        vb[g] = kernel::R32(grp + kGroupVertexData);
+        uint16_t ic = 0;
+        uint32_t st = 0;
+        std::memcpy(&ic, kernel::HostPtr(grp + kGroupIndexCount), 2);
+        std::memcpy(&st, kernel::HostPtr(grp + kGroupIndexStart), 4);
+        if (!vb[g] || ic == 0) return false;
+        icount[g] = ic;
+        istart[g] = st;
+        if (st + ic > idxSpan) idxSpan = st + ic;
+    }
+    if (idxSpan == 0 || !mem::IsCommitted(indexData + idxSpan * 2 - 1)) return false;
+    // validate the tag: group 0 vertex 0 normal == (0.1337, 0, 0)
+    float n0[3];
+    std::memcpy(n0, static_cast<const uint8_t*>(kernel::HostPtr(vb[0])) + 0x14, 12);
+    if (std::fabs(n0[0] - kAgnesTagX) > 0.0021f || std::fabs(n0[1]) > 0.0021f || std::fabs(n0[2]) > 0.0021f) {
+        static bool tagFailLogged = false;
+        if (!tagFailLogged) {
+            tagFailLogged = true;
+            LOGR("agnes anim: BODY tag check failed (normal %.4f %.4f %.4f) - is the tagged flipbook installed?",
+                 n0[0], n0[1], n0[2]);
+        }
+        return false;
+    }
+    // copy the index buffer, then build the remap (index-encounter order)
+    std::vector<uint16_t> indices(idxSpan);
+    std::memcpy(indices.data(), kernel::HostPtr(indexData), idxSpan * 2);
+    std::vector<uint32_t> remap(anims.verts, 0xFFFFFFFFu);
+    for (uint32_t g = 0; g < gc; ++g) {
+        m.vbuf[g] = vb[g];
+        m.invRemap[g].reserve(4096);
+        for (uint32_t k = 0; k < icount[g]; ++k) {
+            uint32_t gi = indices[istart[g] + k];
+            if (gi >= anims.verts) continue;
+            if (remap[gi] == 0xFFFFFFFFu) {
+                remap[gi] = (g << 24) | (uint32_t)m.invRemap[g].size();
+                m.invRemap[g].push_back(gi);
+            }
+        }
+    }
+    for (uint32_t v = 0; v < anims.verts; ++v) {
+        if (remap[v] == 0xFFFFFFFFu) {
+            LOGR("agnes anim: vertex %u not covered by any group", v);
+            return false;
+        }
+    }
+    m.groupCount = gc;
+    m.resolved = true;
+    LOGR("agnes anim: BODY resolved (render %08X, %u groups, %u verts)", render, gc, anims.verts);
+    return true;
+}
+
+// Speed band -> clip index: 0 Walk, 1 Jog, 2 Run, 3 Sprint.
+int AgnesClipForSpeed(float kmh) {
+    if (kmh < 15.0f) return 0;
+    if (kmh < 30.0f) return 1;
+    if (kmh < 70.0f) return 2;
+    return 3;
+}
+
+float AgnesSmoothstep(float t) {
+    if (t <= 0) return 0;
+    if (t >= 1) return 1;
+    return t * t * (3 - 2 * t);
+}
+
+// Per-frame Agnes animation. Called from ModCarsFrame every presented frame.
+// Hides BASE (slot 0), shows + animates BODY (slot 23, LOD 0). State lives in
+// port-side statics; the model pointers + remap are cached after first resolve.
+void AgnesAnimateFrame() {
+    const AgnesAnims& anims = LoadAgnesAnims();
+    static AgnesModel model;
+    static double phase = 0;        // current clip phase [0,1)
+    static double prevPhase = 0;    // previous clip phase (crossfade source)
+    static int clip = 2;            // current clip (start on Run)
+    static int prevClip = -1;       // clip being faded out, -1 = none
+    static double crossfadeT = 1.0;  // 1 = no crossfade in progress
+    static float prevX = 0, prevY = 0, prevZ = 0;
+    static bool havePrev = false;
+    static double lastTime = 0;
+    static float smoothKmh = 0;
+    static bool activeLogged = false;
+    if (!Racing()) {
+        havePrev = false;
+        lastTime = 0;
+        smoothKmh = 0;
+        return;
+    }
+    if (!anims.loaded) return;
+    if (!mem::IsCommitted(kWorldCarList)) return;
+    double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    double dt = lastTime > 0 ? now - lastTime : 1.0 / 60.0;
+    lastTime = now;
+    if (dt < 1.0 / 240.0) dt = 1.0 / 240.0;
+    if (dt > 1.0 / 10.0) dt = 1.0 / 10.0;
+    uint32_t head = kWorldCarList;
+    uint32_t node = kernel::R32(head);
+    uint32_t agnesRender = 0;
+    float x = 0, y = 0, z = 0;
+    for (int guard = 0; node != head && node != 0 && guard < 64; ++guard) {
+        if (!mem::IsCommitted(node) || !mem::IsCommitted(node + kNodePosZ)) break;
+        uint32_t render = kernel::R32(node + kNodeRenderObj);
+        uint32_t next = kernel::R32(node + kNodeNext);
+        if (render && IsAgnesRenderObj(render)) {
+            agnesRender = render;
+            std::memcpy(&x, kernel::HostPtr(node + kNodePosX), 4);
+            std::memcpy(&y, kernel::HostPtr(node + kNodePosY), 4);
+            std::memcpy(&z, kernel::HostPtr(node + kNodePosZ), 4);
+            break;
+        }
+        node = next;
+    }
+    if (!agnesRender) {
+        havePrev = false;
+        return;
+    }
+    // Hide BASE, show BODY (only writes when the bit must change).
+    for (uint32_t l = 0; l < kPartLods; ++l) {
+        uint32_t e_base = agnesRender + kPartTable + kAgnesBaseSlot * kPartSlotStride + l * 4;
+        uint32_t e_body = agnesRender + kPartTable + kAgnesBodySlot * kPartSlotStride + l * 4;
+        if (!mem::IsCommitted(e_base) || !mem::IsCommitted(e_body)) continue;
+        uint32_t v_base = kernel::R32(e_base), v_body = kernel::R32(e_body);
+        uint32_t n_base = v_base | 1u, n_body = v_body & ~1u;
+        if (n_base != v_base) kernel::W32(e_base, n_base);
+        if (n_body != v_body) kernel::W32(e_body, n_body);
+    }
+    if (!ResolveAgnesModel(agnesRender, model)) return;
+    if (!activeLogged) {
+        activeLogged = true;
+        LOGR("agnes anim: Agnes animation active (render object %08X)", agnesRender);
+    }
+    // Speed from the position delta (m/s -> km/h), smoothed.
+    float kmh = 0;
+    if (havePrev) {
+        float dx = x - prevX, dy = y - prevY, dz = z - prevZ;
+        double step = std::sqrt(double(dx) * dx + double(dy) * dy + double(dz) * dz);
+        if (step < 10.0) kmh = float(step / dt * 3.6);
+    }
+    prevX = x;
+    prevY = y;
+    prevZ = z;
+    havePrev = true;
+    smoothKmh = smoothKmh * 0.7f + kmh * 0.3f;
+    // Select the clip by band; start a crossfade on change.
+    int want = AgnesClipForSpeed(smoothKmh);
+    if (want != clip) {
+        prevClip = clip;
+        prevPhase = phase;
+        clip = want;
+        phase = 0;
+        crossfadeT = 0;
+    }
+    // Advance the current clip's phase (constant playback per band).
+    const AgnesClipInfo& cur = anims.clips[clip];
+    phase += dt / cur.cycle;
+    if (phase >= 1.0) phase -= 1.0;
+    if (prevClip >= 0) {
+        const AgnesClipInfo& pc = anims.clips[prevClip];
+        prevPhase += dt / pc.cycle;
+        if (prevPhase >= 1.0) prevPhase -= 1.0;
+        crossfadeT += dt / kAgnesCrossfadeSecs;
+        if (crossfadeT >= 1.0) {
+            prevClip = -1;
+            crossfadeT = 1.0;
+        }
+    }
+    float blend = prevClip >= 0 ? AgnesSmoothstep((float)crossfadeT) : 1.0f;
+    // Interpolated frame indices for the current (and previous) clip.
+    auto framePair = [](const AgnesClipInfo& c, double ph, int& f0, int& f1, float& t) {
+        double ff = ph * c.frames;
+        int i0 = (int)ff;
+        if (i0 >= (int)c.frames) i0 = (int)c.frames - 1;
+        f0 = i0;
+        f1 = (i0 + 1) % (int)c.frames;
+        t = (float)(ff - i0);
+    };
+    int f0, f1;
+    float t;
+    framePair(cur, phase, f0, f1, t);
+    int pf0 = 0, pf1 = 0;
+    float pt = 0;
+    if (prevClip >= 0) framePair(anims.clips[prevClip], prevPhase, pf0, pf1, pt);
+    const uint8_t* base = anims.file.data();
+    const float* curA = reinterpret_cast<const float*>(base + cur.data_off + (size_t)f0 * anims.verts * 3);
+    const float* curB = reinterpret_cast<const float*>(base + cur.data_off + (size_t)f1 * anims.verts * 3);
+    const float* prevA = nullptr;
+    const float* prevB = nullptr;
+    if (prevClip >= 0) {
+        const AgnesClipInfo& pc = anims.clips[prevClip];
+        prevA = reinterpret_cast<const float*>(base + pc.data_off + (size_t)pf0 * anims.verts * 3);
+        prevB = reinterpret_cast<const float*>(base + pc.data_off + (size_t)pf1 * anims.verts * 3);
+    }
+    // Write every vertex: interpolated position + flat normal (0,0,1); UV untouched.
+    for (uint32_t g = 0; g < model.groupCount; ++g) {
+        uint8_t* vb = static_cast<uint8_t*>(kernel::HostPtr(model.vbuf[g]));
+        for (uint32_t local = 0, n = (uint32_t)model.invRemap[g].size(); local < n; ++local) {
+            uint32_t gv = model.invRemap[g][local];
+            const float* a = curA + (size_t)gv * 3;
+            const float* b = curB + (size_t)gv * 3;
+            float px = a[0] + (b[0] - a[0]) * t;
+            float py = a[1] + (b[1] - a[1]) * t;
+            float pz = a[2] + (b[2] - a[2]) * t;
+            if (prevClip >= 0) {
+                const float* pa = prevA + (size_t)gv * 3;
+                const float* pb = prevB + (size_t)gv * 3;
+                float ox = pa[0] + (pb[0] - pa[0]) * pt;
+                float oy = pa[1] + (pb[1] - pa[1]) * pt;
+                float oz = pa[2] + (pb[2] - pa[2]) * pt;
+                px = ox + (px - ox) * blend;
+                py = oy + (py - oy) * blend;
+                pz = oz + (pz - oz) * blend;
+            }
+            uint8_t* dst = vb + (size_t)local * 32;
+            std::memcpy(dst + 0, &px, 4);
+            std::memcpy(dst + 4, &py, 4);
+            std::memcpy(dst + 8, &pz, 4);
+            static const float flatN[3] = {0.0f, 0.0f, 1.0f};
+            std::memcpy(dst + 0x14, flatN, 12);
+        }
+    }
+}
+
 }  // namespace
 
 // GetTextureInfo's question, on the game thread: our TextureInfo for the name texture's hash, else 0
@@ -286,13 +642,14 @@ void ModCarsFrame(X86Context& ctx) {
         static bool logged = false;
         if (!logged) {
             logged = true;
-            LOGR("flipbook dbg: ModCarsFrame cars=%u removed=%u", (unsigned)cars.size(), (unsigned)removed.size());
+            LOGR("agnes dbg: ModCarsFrame cars=%u removed=%u", (unsigned)cars.size(), (unsigned)removed.size());
         }
     }
     if (cars.empty() && removed.empty()) return;
-    // The Agnes flipbook runs next: it needs no profile, and it must run every
-    // frame (not just on the 30-frame car-list sync below).
-    FlipbookFrame();
+    // The Agnes vertex-cache animation runs next: it needs no profile, and it
+    // must run every frame (not just on the 30-frame car-list sync below).
+    // (The flipbook pose switcher is superseded by the animation.)
+    AgnesAnimateFrame();
     uint32_t db = kernel::R32(kFeDatabase);
     uint32_t profile = db && mem::IsCommitted(db + kProfile) ? kernel::R32(db + kProfile) : 0;
     if (!profile || !mem::IsCommitted(profile + kPlayerCarDb + kEntries * kEntry - 1)) return;
