@@ -340,6 +340,16 @@ struct AgnesModel {
     std::vector<uint32_t> invRemap[kAgnesMaxGroups];
 };
 
+// Diagnostic (temporary): log each ResolveAgnesModel failure step once, so the
+// log shows exactly which link of the vertex-buffer chain breaks.
+void ResolveFailLog(int step, uint32_t render) {
+    static bool logged[16] = {};
+    if (step >= 0 && step < 16 && !logged[step]) {
+        logged[step] = true;
+        LOGR("agnes dbg: resolve fail step %d render %08X", step, render);
+    }
+}
+
 // Resolve the BODY model's vertex buffers for an Agnes render object.
 // Validates with the (0.1337, 0, 0) tag, then caches the pointers + remap.
 bool ResolveAgnesModel(uint32_t render, AgnesModel& m) {
@@ -347,22 +357,22 @@ bool ResolveAgnesModel(uint32_t render, AgnesModel& m) {
     m = AgnesModel();
     m.render = render;
     const AgnesAnims& anims = LoadAgnesAnims();
-    if (!anims.loaded) return false;
+    if (!anims.loaded) { ResolveFailLog(1, render); return false; }
     uint32_t e = render + kPartTable + kAgnesBodySlot * kPartSlotStride + 0 * 4;
-    if (!mem::IsCommitted(e)) return false;
+    if (!mem::IsCommitted(e)) { ResolveFailLog(2, render); return false; }
     uint32_t model = kernel::R32(e) & ~1u;
-    if (!model || !mem::IsCommitted(model + kAgnesModelDef)) return false;
+    if (!model || !mem::IsCommitted(model + kAgnesModelDef)) { ResolveFailLog(3, render); return false; }
     uint32_t p = kernel::R32(model + kAgnesModelDef);
     uint32_t modelData = 0;
     if (p && mem::IsCommitted(p)) modelData = kernel::R32(p);
     if (!modelData && mem::IsCommitted(model)) modelData = kernel::R32(model);  // fallback: [model+0]
-    if (!modelData || !mem::IsCommitted(modelData + kModelDataGroupCount)) return false;
+    if (!modelData || !mem::IsCommitted(modelData + kModelDataGroupCount)) { ResolveFailLog(4, render); return false; }
     uint32_t groups = kernel::R32(modelData + kModelDataGroups);
     uint32_t indexData = kernel::R32(modelData + kModelDataIndices);
-    if (!groups || !indexData) return false;
+    if (!groups || !indexData) { ResolveFailLog(5, render); return false; }
     uint16_t gc = 0;
     std::memcpy(&gc, kernel::HostPtr(modelData + kModelDataGroupCount), 2);
-    if (gc == 0 || gc > kAgnesMaxGroups) return false;
+    if (gc == 0 || gc > kAgnesMaxGroups) { ResolveFailLog(6, render); return false; }
     // group headers first (vbuf, index count/start), and the index span
     uint32_t vb[kAgnesMaxGroups] = {};
     uint32_t istart[kAgnesMaxGroups] = {};
@@ -370,18 +380,18 @@ bool ResolveAgnesModel(uint32_t render, AgnesModel& m) {
     uint32_t idxSpan = 0;
     for (uint32_t g = 0; g < gc; ++g) {
         uint32_t grp = groups + g * kGroupRecordSize;
-        if (!mem::IsCommitted(grp + kGroupVertexData + 4)) return false;
+        if (!mem::IsCommitted(grp + kGroupVertexData + 4)) { ResolveFailLog(7, render); return false; }
         vb[g] = kernel::R32(grp + kGroupVertexData);
         uint16_t ic = 0;
         uint32_t st = 0;
         std::memcpy(&ic, kernel::HostPtr(grp + kGroupIndexCount), 2);
         std::memcpy(&st, kernel::HostPtr(grp + kGroupIndexStart), 4);
-        if (!vb[g] || ic == 0) return false;
+        if (!vb[g] || ic == 0) { ResolveFailLog(8, render); return false; }
         icount[g] = ic;
         istart[g] = st;
         if (st + ic > idxSpan) idxSpan = st + ic;
     }
-    if (idxSpan == 0 || !mem::IsCommitted(indexData + idxSpan * 2 - 1)) return false;
+    if (idxSpan == 0 || !mem::IsCommitted(indexData + idxSpan * 2 - 1)) { ResolveFailLog(9, render); return false; }
     // validate the tag: group 0 vertex 0 normal == (0.1337, 0, 0)
     float n0[3];
     std::memcpy(n0, static_cast<const uint8_t*>(kernel::HostPtr(vb[0])) + 0x14, 12);
@@ -465,6 +475,30 @@ void AgnesAnimateFrame() {
     lastTime = now;
     if (dt < 1.0 / 240.0) dt = 1.0 / 240.0;
     if (dt > 1.0 / 10.0) dt = 1.0 / 10.0;
+    // Diagnostic (temporary): sample the world-list walk once per second while
+    // racing, so the log shows whether the list is populated and what type
+    // names the cars actually carry at runtime.
+    {
+        static double lastWalkDiag = 0;
+        if (now - lastWalkDiag >= 1.0) {
+            lastWalkDiag = now;
+            uint32_t headDbg = kernel::R32(kWorldCarList);
+            LOGR("agnes dbg: walk head=%08X", headDbg);
+            int nodesDbg = 0;
+            uint32_t nd = headDbg;
+            for (int g = 0; nd != kWorldCarList && nd != 0 && g < 64; ++g) {
+                if (!mem::IsCommitted(nd) || !mem::IsCommitted(nd + kNodePosZ)) break;
+                uint32_t rd = kernel::R32(nd + kNodeRenderObj);
+                uint32_t nx = kernel::R32(nd + kNodeNext);
+                ++nodesDbg;
+                char nm[16];
+                TypeName(rd, nm, sizeof(nm));
+                LOGR("agnes dbg: node %d render %08X type '%s' hash %08X", nodesDbg, rd, nm, TypeHash(rd));
+                nd = nx;
+            }
+            LOGR("agnes dbg: walk nodes=%d", nodesDbg);
+        }
+    }
     uint32_t head = kWorldCarList;
     uint32_t node = kernel::R32(head);
     uint32_t agnesRender = 0;
