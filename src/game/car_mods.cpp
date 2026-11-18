@@ -129,15 +129,34 @@ constexpr uint32_t kPoseSlotA = 0, kPoseSlotB = 23;  // BASE, _KIT00_BODY
 constexpr uint32_t kAgnesTypeHash = 0x026b540d;      // bhash("AGNES")
 constexpr float kFlipbookStride = 0.5f;              // metres of travel per pose step
 
-bool IsAgnesRenderObj(uint32_t render) {
-    if (!render || !mem::IsCommitted(render + kRenderObjTypeRecord)) return false;
+// The type name's bhash (as TypeOfName computes it), or 0 when the render
+// object has no readable type record.
+uint32_t TypeHash(uint32_t render) {
+    if (!render || !mem::IsCommitted(render + kRenderObjTypeRecord)) return 0;
     uint32_t type_rec = kernel::R32(render + kRenderObjTypeRecord);
-    if (!type_rec || !mem::IsCommitted(type_rec + kTypeName)) return false;
+    if (!type_rec || !mem::IsCommitted(type_rec + kTypeName)) return 0;
     // bhash the type name, as TypeOfName does; "AGNES" -> 0x026b540d
     uint32_t h = 0xFFFFFFFF;
     for (const auto* p = static_cast<const uint8_t*>(kernel::HostPtr(type_rec + kTypeName)); *p; ++p)
         h = h * 33 + *p;
-    return h == kAgnesTypeHash;
+    return h;
+}
+
+// The type name as a short string (up to 15 chars), for the diagnostic log.
+void TypeName(uint32_t render, char* out, size_t n) {
+    out[0] = 0;
+    if (!render || !mem::IsCommitted(render + kRenderObjTypeRecord)) return;
+    uint32_t type_rec = kernel::R32(render + kRenderObjTypeRecord);
+    if (!type_rec || !mem::IsCommitted(type_rec + kTypeName)) return;
+    const auto* p = static_cast<const uint8_t*>(kernel::HostPtr(type_rec + kTypeName));
+    size_t i = 0;
+    for (; i + 1 < n && p[i]; ++i) out[i] = static_cast<char>(p[i]);
+    out[i] = 0;
+}
+
+bool IsAgnesRenderObj(uint32_t render) {
+    uint32_t h = TypeHash(render);
+    return h != 0 && h == kAgnesTypeHash;
 }
 
 // While racing, alternate the two baked running poses as the car travels, one pose
@@ -159,10 +178,23 @@ void FlipbookFrame() {
     uint32_t head = kWorldCarList;
     uint32_t node = kernel::R32(head);
     bool found = false;
+    // Diagnostic (temporary): log the first 3 racing frames' walks, so the log
+    // shows whether the list is walked, how many nodes it has, and what type
+    // names the cars actually carry at runtime.
+    static int diag_frames = 0;
+    bool diag = diag_frames < 3;
+    if (diag) ++diag_frames;
+    int nodes = 0;
     for (int guard = 0; node != head && node != 0 && guard < 64; ++guard) {
         if (!mem::IsCommitted(node) || !mem::IsCommitted(node + kNodePosZ)) break;
         uint32_t render = kernel::R32(node + kNodeRenderObj);
         uint32_t next = kernel::R32(node + kNodeNext);
+        ++nodes;
+        if (diag) {
+            char name[16];
+            TypeName(render, name, sizeof(name));
+            LOGR("flipbook dbg: node %08X render %08X type '%s' hash %08X", node, render, name, TypeHash(render));
+        }
         if (render && IsAgnesRenderObj(render)) {
             found = true;
             float x = 0, y = 0, z = 0;
@@ -196,6 +228,7 @@ void FlipbookFrame() {
         }
         node = next;
     }
+    if (diag) LOGR("flipbook dbg: walk nodes=%d found=%d", nodes, found ? 1 : 0);
     if (!found) {
         have_prev = false;
         distance = 0;
@@ -249,6 +282,13 @@ uint32_t ListedHandle(uint32_t table, uint32_t handle);
 void ModCarsFrame(X86Context& ctx) {
     const std::vector<Car>& cars = Cars();
     const std::vector<uint32_t>& removed = RemovedCars();
+    {  // Diagnostic (temporary): prove whether the early return below fires.
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LOGR("flipbook dbg: ModCarsFrame cars=%u removed=%u", (unsigned)cars.size(), (unsigned)removed.size());
+        }
+    }
     if (cars.empty() && removed.empty()) return;
     // The Agnes flipbook runs next: it needs no profile, and it must run every
     // frame (not just on the 30-frame car-list sync below).
