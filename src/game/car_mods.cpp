@@ -124,6 +124,16 @@ const std::vector<uint32_t>& RemovedCars() {
 constexpr uint32_t kWorldCarList = 0x4D5ED0;
 constexpr uint32_t kNodeNext = 0x00, kNodeRenderObj = 0x318;
 constexpr uint32_t kNodePosX = 0x320, kNodePosY = 0x324, kNodePosZ = 0x328;
+// Route 1 (find_live_car_list.md): the live cars during a race are
+// ExtrapolatedCar objects ("render connections"), registered in the car
+// array. The world-list walk at 0x4D5ED0 is EMPTY during a race (log
+// 2026-11-18: walk nodes=0 for the whole race), so it must not be used.
+constexpr uint32_t kCarArrayBase = 0x4D8698;
+constexpr uint32_t kCarArrayCount = 0x4D86A0;
+constexpr uint32_t kConnState = 0x28, kConnTypeIdx = 0x2C;
+constexpr uint32_t kConnVelPtr = 0x38, kConnModelId = 0x40, kConnRenderObj = 0x44;
+constexpr uint32_t kConnPosX = 0x360, kConnPosY = 0x364, kConnPosZ = 0x368;
+constexpr uint32_t kExtrapolatedCarVtab = 0x3EA5F0;
 constexpr uint32_t kRenderObjTypeRecord = 0x94;
 constexpr uint32_t kPartTable = 0xB94, kPartSlotStride = 20, kPartLods = 5;
 constexpr uint32_t kPoseSlotA = 0, kPoseSlotB = 23;  // BASE, _KIT00_BODY
@@ -469,52 +479,75 @@ void AgnesAnimateFrame() {
         return;
     }
     if (!anims.loaded) return;
-    if (!mem::IsCommitted(kWorldCarList)) return;
+    if (!mem::IsCommitted(kCarArrayBase) || !mem::IsCommitted(kCarArrayCount)) return;
     double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
     double dt = lastTime > 0 ? now - lastTime : 1.0 / 60.0;
     lastTime = now;
     if (dt < 1.0 / 240.0) dt = 1.0 / 240.0;
     if (dt > 1.0 / 10.0) dt = 1.0 / 10.0;
-    // Diagnostic (temporary): sample the world-list walk once per second while
-    // racing, so the log shows whether the list is populated and what type
-    // names the cars actually carry at runtime.
+    // Diagnostic (temporary): sample the car array once per second while
+    // racing, so the log shows whether the array is populated and which
+    // entry is Agnes. Also logs |v| (velocity magnitude) per entry so the
+    // speed units can be calibrated against the position-delta speed.
     {
         static double lastWalkDiag = 0;
         if (now - lastWalkDiag >= 1.0) {
             lastWalkDiag = now;
-            uint32_t headDbg = kernel::R32(kWorldCarList);
-            LOGR("agnes dbg: walk head=%08X", headDbg);
-            int nodesDbg = 0;
-            uint32_t nd = headDbg;
-            for (int g = 0; nd != kWorldCarList && nd != 0 && g < 64; ++g) {
-                if (!mem::IsCommitted(nd) || !mem::IsCommitted(nd + kNodePosZ)) break;
-                uint32_t rd = kernel::R32(nd + kNodeRenderObj);
-                uint32_t nx = kernel::R32(nd + kNodeNext);
-                ++nodesDbg;
-                char nm[16];
-                TypeName(rd, nm, sizeof(nm));
-                LOGR("agnes dbg: node %d render %08X type '%s' hash %08X", nodesDbg, rd, nm, TypeHash(rd));
-                nd = nx;
+            uint32_t baseDbg = kernel::R32(kCarArrayBase);
+            uint32_t countDbg = kernel::R32(kCarArrayCount);
+            LOGR("agnes dbg: carray base=%08X count=%u", baseDbg, countDbg);
+            if (baseDbg && mem::IsCommitted(baseDbg)) {
+                for (uint32_t i = 0; i < countDbg && i < 64; ++i) {
+                    uint32_t connDbg = kernel::R32(baseDbg + i * 4);
+                    if (!connDbg || !mem::IsCommitted(connDbg) || !mem::IsCommitted(connDbg + kConnPosZ)) {
+                        LOGR("agnes dbg: car[%u] conn=%08X (bad)", i, connDbg);
+                        continue;
+                    }
+                    uint32_t vtabDbg = kernel::R32(connDbg);
+                    uint32_t stateDbg = kernel::R32(connDbg + kConnState);
+                    uint32_t typeIdxDbg = kernel::R32(connDbg + kConnTypeIdx);
+                    uint32_t renderDbg = kernel::R32(connDbg + kConnRenderObj);
+                    float velMagDbg = -1.0f;
+                    uint32_t velPtrDbg = kernel::R32(connDbg + kConnVelPtr);
+                    if (velPtrDbg && mem::IsCommitted(velPtrDbg + 8)) {
+                        float vx, vy, vz;
+                        std::memcpy(&vx, kernel::HostPtr(velPtrDbg), 4);
+                        std::memcpy(&vy, kernel::HostPtr(velPtrDbg + 4), 4);
+                        std::memcpy(&vz, kernel::HostPtr(velPtrDbg + 8), 4);
+                        velMagDbg = std::sqrt(vx * vx + vy * vy + vz * vz);
+                    }
+                    char nm[16];
+                    TypeName(renderDbg, nm, sizeof(nm));
+                    LOGR("agnes dbg: car[%u] conn=%08X vtab=%08X state=%u typeIdx=%u renderObj=%08X type='%s' |v|=%.2f",
+                         i, connDbg, vtabDbg, stateDbg, typeIdxDbg, renderDbg, nm, velMagDbg);
+                }
             }
-            LOGR("agnes dbg: walk nodes=%d", nodesDbg);
         }
     }
-    uint32_t head = kWorldCarList;
-    uint32_t node = kernel::R32(head);
+    // Route 1: walk the car array (0x4D8698). Each element is an
+    // ExtrapolatedCar (render connection); its render object is at +0x44
+    // and its world position at +0x360/+0x364/+0x368. Speed still uses the
+    // position delta (km/h, known units); the velocity |v| is logged in the
+    // diagnostic above so its units can be calibrated later.
     uint32_t agnesRender = 0;
     float x = 0, y = 0, z = 0;
-    for (int guard = 0; node != head && node != 0 && guard < 64; ++guard) {
-        if (!mem::IsCommitted(node) || !mem::IsCommitted(node + kNodePosZ)) break;
-        uint32_t render = kernel::R32(node + kNodeRenderObj);
-        uint32_t next = kernel::R32(node + kNodeNext);
-        if (render && IsAgnesRenderObj(render)) {
-            agnesRender = render;
-            std::memcpy(&x, kernel::HostPtr(node + kNodePosX), 4);
-            std::memcpy(&y, kernel::HostPtr(node + kNodePosY), 4);
-            std::memcpy(&z, kernel::HostPtr(node + kNodePosZ), 4);
-            break;
+    if (mem::IsCommitted(kCarArrayBase) && mem::IsCommitted(kCarArrayCount)) {
+        uint32_t base = kernel::R32(kCarArrayBase);
+        uint32_t count = kernel::R32(kCarArrayCount);
+        if (base && mem::IsCommitted(base) && count > 0 && count < 64) {
+            for (uint32_t i = 0; i < count; ++i) {
+                uint32_t conn = kernel::R32(base + i * 4);
+                if (!conn || !mem::IsCommitted(conn) || !mem::IsCommitted(conn + kConnPosZ)) continue;
+                uint32_t render = kernel::R32(conn + kConnRenderObj);
+                if (render && IsAgnesRenderObj(render)) {
+                    agnesRender = render;
+                    std::memcpy(&x, kernel::HostPtr(conn + kConnPosX), 4);
+                    std::memcpy(&y, kernel::HostPtr(conn + kConnPosY), 4);
+                    std::memcpy(&z, kernel::HostPtr(conn + kConnPosZ), 4);
+                    break;
+                }
+            }
         }
-        node = next;
     }
     if (!agnesRender) {
         havePrev = false;
